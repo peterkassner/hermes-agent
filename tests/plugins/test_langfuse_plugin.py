@@ -236,6 +236,63 @@ class TestTraceScopeKey:
         assert plugin._trace_key("task-1", "session-1") == "task-1"
 
 
+class TestTraceTags:
+    def test_root_trace_includes_exact_model_tag_when_known(self, monkeypatch):
+        """Langfuse trace filters should expose the model used for this turn."""
+        sys.modules.pop("plugins.observability.langfuse", None)
+        mod = importlib.import_module("plugins.observability.langfuse")
+        captured = []
+        root_observation_args = []
+
+        class AttrContext:
+            def __enter__(self):
+                return None
+
+            def __exit__(self, *exc):
+                return False
+
+        class RootSpan:
+            def set_trace_io(self, **kwargs):
+                pass
+
+        class RootContext:
+            def __enter__(self):
+                return RootSpan()
+
+            def __exit__(self, *exc):
+                return False
+
+        class Client:
+            def create_trace_id(self, **kwargs):
+                return "trace-model-tag"
+
+            def start_as_current_observation(self, **kwargs):
+                root_observation_args.append(kwargs)
+                return RootContext()
+
+        def capture_attributes(**kwargs):
+            captured.append(kwargs)
+            return AttrContext()
+
+        monkeypatch.setattr(mod, "propagate_attributes", capture_attributes)
+        mod._start_root_trace(
+            "turn-key",
+            task_id="task-1",
+            session_id="session-1",
+            platform="cli",
+            provider="openai-codex",
+            model="gpt-5.6-terra",
+            api_mode="codex_responses",
+            messages=[{"role": "user", "content": "hello"}],
+            client=Client(),
+        )
+
+        assert captured[0]["tags"] == ["hermes", "langfuse", "model:gpt-5.6-terra"]
+        assert root_observation_args[0]["metadata"]["langfuse_trace_id"] == "trace-model-tag"
+        assert root_observation_args[0]["metadata"]["tui_session_id"] == "session-1"
+        assert mod._trace_tags("   ") == ["hermes", "langfuse"]
+
+
 # ---------------------------------------------------------------------------
 # End-to-end collision regression: two turns of ONE gateway session must not
 # share trace state.  The helper-level tests above prove _trace_key returns
@@ -736,7 +793,7 @@ class TestToolCallOutputBackfill:
 
         ended = {}
 
-        def fake_end_observation(obs, *, output=None, metadata=None, usage_details=None, cost_details=None):
+        def fake_end_observation(obs, *, output=None, metadata=None, usage_details=None, cost_details=None, **kwargs):
             ended["observation"] = obs
             ended["output"] = output
             ended["metadata"] = metadata
@@ -947,6 +1004,84 @@ class TestToolObservationKeying:
         assert ended["obs"] is obs
         assert ended["output"] == {"status": "done"}
         assert not state.tools
+
+
+class TestToolOutcomeTelemetry:
+    def test_failed_ambiguous_skill_is_queryable_and_flushes(self, monkeypatch):
+        sys.modules.pop("plugins.observability.langfuse", None)
+        mod = importlib.import_module("plugins.observability.langfuse")
+
+        class Observation:
+            def __init__(self):
+                self.updates = []
+                self.ended = False
+
+            def update(self, **kwargs):
+                self.updates.append(kwargs)
+
+            def end(self):
+                self.ended = True
+
+        class Client:
+            def __init__(self):
+                self.flush_count = 0
+
+            def flush(self):
+                self.flush_count += 1
+
+        client = Client()
+        tool_observation = Observation()
+        root_observation = Observation()
+        state = mod.TraceState(
+            trace_id="trace-observability",
+            root_ctx=None,
+            root_span=root_observation,
+        )
+        state.tools["call-ambiguous"] = tool_observation
+        monkeypatch.setitem(
+            mod._TRACE_STATE,
+            mod._trace_key("task-observability", "session-observability"),
+            state,
+        )
+        monkeypatch.setattr(mod, "_get_langfuse", lambda: client)
+        monkeypatch.setenv("HERMES_LANGFUSE_FLUSH_EVERY_TOOLS", "1")
+
+        mod.on_post_tool_call(
+            tool_name="skill_view",
+            args={"name": "hermes-agent"},
+            result={
+                "success": False,
+                "error": "Ambiguous skill name 'hermes-agent'",
+                "matches": ["autonomous-ai-agents/hermes-agent", "hermes-agent"],
+            },
+            task_id="task-observability",
+            session_id="session-observability",
+            tool_call_id="call-ambiguous",
+            duration_ms=137,
+            status="error",
+            error_type="tool_error",
+            error_message="Ambiguous skill name 'hermes-agent'",
+            middleware_trace=[{"name": "allowlist", "decision": "allowed"}],
+        )
+
+        assert tool_observation.ended is True
+        tool_update = tool_observation.updates[0]
+        assert tool_update["level"] == "ERROR"
+        assert tool_update["status_message"] == "Ambiguous skill name 'hermes-agent'"
+        metadata = tool_update["metadata"]
+        assert metadata["duration_ms"] == 137
+        assert metadata["status"] == "error"
+        assert metadata["error_type"] == "tool_error"
+        assert metadata["error_code"] == "ambiguous_skill"
+        assert metadata["requested_skill"] == "hermes-agent"
+        assert metadata["candidate_count"] == 2
+        assert metadata["tool_call_id"] == "call-ambiguous"
+        assert metadata["langfuse_trace_id"] == "trace-observability"
+        assert metadata["tui_session_id"] == "session-observability"
+        assert metadata["middleware_decisions"] == [{"name": "allowlist", "decision": "allowed"}]
+        assert root_observation.updates[0]["level"] == "ERROR"
+        assert root_observation.updates[0]["metadata"]["has_tool_failure"] is True
+        assert client.flush_count == 1
 
 
 class TestUsageFromSanitizedResponse:

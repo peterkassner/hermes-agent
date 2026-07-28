@@ -942,6 +942,7 @@ def handle_function_call(
     if not isinstance(function_args, dict):
         function_args = {}
     _tool_middleware_trace = list(tool_request_middleware_trace or [])
+    _tool_call_started = time.monotonic()
 
     # ── Tool Search bridge dispatch ──────────────────────────────────
     # tool_search and tool_describe are pure catalog reads — handle them
@@ -977,16 +978,54 @@ def handle_function_call(
         except Exception:
             current_defs = []
         if function_name == _ts_mod.TOOL_SEARCH_NAME:
-            return _ts_mod.dispatch_tool_search(function_args or {},
-                                                current_tool_defs=current_defs)
-        if function_name == _ts_mod.TOOL_DESCRIBE_NAME:
-            return _ts_mod.dispatch_tool_describe(function_args or {},
+            result = _ts_mod.dispatch_tool_search(function_args or {},
                                                   current_tool_defs=current_defs)
+            _emit_post_tool_call_hook(
+                function_name=function_name,
+                function_args=function_args,
+                result=result,
+                task_id=task_id,
+                session_id=session_id,
+                tool_call_id=tool_call_id,
+                turn_id=turn_id,
+                api_request_id=api_request_id,
+                duration_ms=int((time.monotonic() - _tool_call_started) * 1000),
+                middleware_trace=list(_tool_middleware_trace),
+            )
+            return result
+        if function_name == _ts_mod.TOOL_DESCRIBE_NAME:
+            result = _ts_mod.dispatch_tool_describe(function_args or {},
+                                                    current_tool_defs=current_defs)
+            _emit_post_tool_call_hook(
+                function_name=function_name,
+                function_args=function_args,
+                result=result,
+                task_id=task_id,
+                session_id=session_id,
+                tool_call_id=tool_call_id,
+                turn_id=turn_id,
+                api_request_id=api_request_id,
+                duration_ms=int((time.monotonic() - _tool_call_started) * 1000),
+                middleware_trace=list(_tool_middleware_trace),
+            )
+            return result
         if function_name == _ts_mod.TOOL_CALL_NAME:
             underlying_name, underlying_args, err = _ts_mod.resolve_underlying_call(function_args or {})
             if err or not underlying_name:
-                return json.dumps({"error": err or "tool_call could not be resolved"},
-                                  ensure_ascii=False)
+                result = json.dumps({"error": err or "tool_call could not be resolved"}, ensure_ascii=False)
+                _emit_post_tool_call_hook(
+                    function_name=function_name,
+                    function_args=function_args,
+                    result=result,
+                    task_id=task_id,
+                    session_id=session_id,
+                    tool_call_id=tool_call_id,
+                    turn_id=turn_id,
+                    api_request_id=api_request_id,
+                    duration_ms=int((time.monotonic() - _tool_call_started) * 1000),
+                    middleware_trace=list(_tool_middleware_trace),
+                )
+                return result
             # Defense in depth: the underlying tool MUST be in the session's
             # scoped deferrable catalog. resolve_underlying_call() only checks
             # that the name is deferrable in the global registry; this gate
@@ -995,12 +1034,25 @@ def handle_function_call(
             # the bridge even if the catalog scoping above regressed.
             _scoped_deferrable = _ts_mod.scoped_deferrable_names(current_defs)
             if underlying_name not in _scoped_deferrable:
-                return json.dumps({
+                result = json.dumps({
                     "error": (
                         f"'{underlying_name}' is not available in this session. "
                         "Use tool_search to find tools you can call."
                     ),
                 }, ensure_ascii=False)
+                _emit_post_tool_call_hook(
+                    function_name=function_name,
+                    function_args=function_args,
+                    result=result,
+                    task_id=task_id,
+                    session_id=session_id,
+                    tool_call_id=tool_call_id,
+                    turn_id=turn_id,
+                    api_request_id=api_request_id,
+                    duration_ms=int((time.monotonic() - _tool_call_started) * 1000),
+                    middleware_trace=list(_tool_middleware_trace),
+                )
+                return result
             # Recurse with the underlying tool. All hooks fire against the
             # real tool name. The bridge is invisible to hooks by design.
             return handle_function_call(
@@ -1009,6 +1061,8 @@ def handle_function_call(
                 task_id=task_id,
                 tool_call_id=tool_call_id,
                 session_id=session_id,
+                turn_id=turn_id,
+                api_request_id=api_request_id,
                 user_task=user_task,
                 enabled_tools=enabled_tools,
                 skip_pre_tool_call_hook=skip_pre_tool_call_hook,
@@ -1040,7 +1094,24 @@ def handle_function_call(
 
     try:
         if function_name in _AGENT_LOOP_TOOLS:
-            return json.dumps({"error": f"{function_name} must be handled by the agent loop"})
+            error_message = f"{function_name} must be handled by the agent loop"
+            result = json.dumps({"error": error_message})
+            _emit_post_tool_call_hook(
+                function_name=function_name,
+                function_args=function_args,
+                result=result,
+                task_id=task_id,
+                session_id=session_id,
+                tool_call_id=tool_call_id,
+                turn_id=turn_id,
+                api_request_id=api_request_id,
+                duration_ms=int((time.monotonic() - _tool_call_started) * 1000),
+                status="error",
+                error_type="agent_loop_only",
+                error_message=error_message,
+                middleware_trace=list(_tool_middleware_trace),
+            )
+            return result
 
         # Check plugin hooks for a block directive (unless caller already
         # checked — e.g. run_agent._invoke_tool passes skip=True to
@@ -1080,6 +1151,7 @@ def handle_function_call(
                     tool_call_id=tool_call_id,
                     turn_id=turn_id,
                     api_request_id=api_request_id,
+                    duration_ms=int((time.monotonic() - _tool_call_started) * 1000),
                     status="blocked",
                     error_type="plugin_block",
                     error_message=block_message,
@@ -1095,11 +1167,43 @@ def handle_function_call(
 
             edit_block_message = maybe_require_edit_approval(function_name, function_args)
             if edit_block_message is not None:
+                _emit_post_tool_call_hook(
+                    function_name=function_name,
+                    function_args=function_args,
+                    result=edit_block_message,
+                    task_id=task_id,
+                    session_id=session_id,
+                    tool_call_id=tool_call_id,
+                    turn_id=turn_id,
+                    api_request_id=api_request_id,
+                    duration_ms=int((time.monotonic() - _tool_call_started) * 1000),
+                    status="blocked",
+                    error_type="edit_approval",
+                    error_message="Edit approval required",
+                    middleware_trace=list(_tool_middleware_trace),
+                )
                 return edit_block_message
         except Exception as _edit_approval_err:
             logger.debug("ACP edit approval guard error: %s", _edit_approval_err)
             if function_name in {"write_file", "patch"}:
-                return json.dumps({"error": "Edit approval denied: approval guard failed"}, ensure_ascii=False)
+                error_message = "Edit approval denied: approval guard failed"
+                result = json.dumps({"error": error_message}, ensure_ascii=False)
+                _emit_post_tool_call_hook(
+                    function_name=function_name,
+                    function_args=function_args,
+                    result=result,
+                    task_id=task_id,
+                    session_id=session_id,
+                    tool_call_id=tool_call_id,
+                    turn_id=turn_id,
+                    api_request_id=api_request_id,
+                    duration_ms=int((time.monotonic() - _tool_call_started) * 1000),
+                    status="blocked",
+                    error_type="edit_approval_guard",
+                    error_message=error_message,
+                    middleware_trace=list(_tool_middleware_trace),
+                )
+                return result
 
         # Notify the read-loop tracker when a non-read/search tool runs,
         # so the *consecutive* counter resets (reads after other work are fine).
@@ -1223,7 +1327,24 @@ def handle_function_call(
     except Exception as e:
         error_msg = f"Error executing {function_name}: {str(e)}"
         logger.exception(error_msg)
-        return json.dumps({"error": _sanitize_tool_error(error_msg)}, ensure_ascii=False)
+        sanitized_error = _sanitize_tool_error(error_msg)
+        result = json.dumps({"error": sanitized_error}, ensure_ascii=False)
+        _emit_post_tool_call_hook(
+            function_name=function_name,
+            function_args=function_args,
+            result=result,
+            task_id=task_id,
+            session_id=session_id,
+            tool_call_id=tool_call_id,
+            turn_id=turn_id,
+            api_request_id=api_request_id,
+            duration_ms=int((time.monotonic() - _tool_call_started) * 1000),
+            status="error",
+            error_type=type(e).__name__,
+            error_message=sanitized_error,
+            middleware_trace=list(_tool_middleware_trace),
+        )
+        return result
 
 
 # =============================================================================

@@ -18,6 +18,8 @@ Optional env vars:
   HERMES_LANGFUSE_RELEASE     - release/version tag
   HERMES_LANGFUSE_SAMPLE_RATE - sampling rate 0.0–1.0 (default: 1.0)
   HERMES_LANGFUSE_MAX_CHARS   - max chars per field (default: 12000)
+  HERMES_LANGFUSE_FLUSH_EVERY_TOOLS - flush after this many completed tools (default: 5)
+  HERMES_LANGFUSE_FLUSH_INTERVAL_S  - max seconds between tool flushes (default: 5)
   HERMES_LANGFUSE_DEBUG       - set to "true" for verbose logging
 """
 from __future__ import annotations
@@ -49,6 +51,9 @@ class TraceState:
     tools: Dict[str, Any] = field(default_factory=dict)
     pending_tools_by_name: Dict[str, list] = field(default_factory=dict)
     turn_tool_calls: list[dict[str, Any]] = field(default_factory=list)
+    completed_tool_count_since_flush: int = 0
+    last_tool_flush_at: float = field(default_factory=time.monotonic)
+    has_tool_failure: bool = False
     last_updated_at: float = field(default_factory=time.time)
 
 
@@ -67,6 +72,7 @@ _LANGFUSE_CLIENT = None
 _READ_FILE_LINE_RE = re.compile(r"^\s*(\d+)\|(.*)$")
 _READ_FILE_HEAD_LINES = 25
 _READ_FILE_TAIL_LINES = 15
+_TOOL_FAILURE_STATUSES = frozenset({"error", "blocked", "cancelled", "failed"})
 
 # Langfuse-issued keys always carry these prefixes (cloud or self-hosted —
 # the prefix is baked into the server-side issuance flow, not a UI hint).
@@ -99,6 +105,22 @@ def _debug_enabled() -> bool:
 def _debug(message: str) -> None:
     if _debug_enabled():
         logger.info("Langfuse tracing: %s", message)
+
+
+def _env_positive_int(name: str, default: int) -> int:
+    try:
+        return max(1, int(_env(name, str(default))))
+    except (TypeError, ValueError):
+        logger.warning("Invalid %s=%r; using %s", name, _env(name), default)
+        return default
+
+
+def _env_positive_float(name: str, default: float) -> float:
+    try:
+        return max(0.1, float(_env(name, str(default))))
+    except (TypeError, ValueError):
+        logger.warning("Invalid %s=%r; using %s", name, _env(name), default)
+        return default
 
 
 # Sentinel: "_get_langfuse() has tried and failed". Lets us short-circuit
@@ -538,6 +560,50 @@ def _serialize_assistant_message(message: Any) -> dict[str, Any]:
     }
 
 
+def _trace_tags(model: str) -> list[str]:
+    """Return stable Langfuse trace tags, including the exact model when known."""
+    tags = ["hermes", "langfuse"]
+    normalized_model = str(model or "").strip()
+    if normalized_model:
+        tags.append(f"model:{normalized_model}")
+    return tags
+
+
+def _is_tool_failure(status: Any) -> bool:
+    return str(status or "").strip().lower() in _TOOL_FAILURE_STATUSES
+
+
+def _tool_error_metadata(
+    *,
+    args: Any,
+    result: Any,
+    status: Any,
+    error_type: Any,
+    error_message: Any,
+) -> dict[str, Any]:
+    """Return compact, queryable diagnostics without duplicating payloads."""
+    metadata: dict[str, Any] = {}
+    result_dict = result if isinstance(result, dict) else {}
+    message = error_message or result_dict.get("error")
+    normalized_message = str(message or "")
+    normalized_status = str(status or "ok").strip().lower() or "ok"
+
+    if _is_tool_failure(normalized_status):
+        metadata["error_code"] = str(error_type or "tool_error")
+        if normalized_message:
+            metadata["error_message"] = _truncate_text(normalized_message, 1000)
+
+    if "ambiguous skill name" in normalized_message.lower():
+        metadata["error_code"] = "ambiguous_skill"
+        if isinstance(args, dict) and isinstance(args.get("name"), str):
+            metadata["requested_skill"] = args["name"]
+        matches = result_dict.get("matches")
+        if isinstance(matches, list):
+            metadata["candidate_count"] = len(matches)
+
+    return metadata
+
+
 def _usage_and_cost(response: Any, *, provider: str, api_mode: str, model: str, base_url: str) -> tuple[dict[str, int], dict[str, float]]:
     usage_details: Dict[str, int] = {}
     cost_details: Dict[str, float] = {}
@@ -607,6 +673,9 @@ def _start_root_trace(task_key: str, *, task_id: str, session_id: str, platform:
     trace_input = _extract_last_user_message(messages)
     metadata = {
         "source": "hermes",
+        "langfuse_trace_id": trace_id,
+        "hermes_session_id": session_id,
+        "tui_session_id": session_id,
         "task_id": task_id,
         "turn_id": turn_id,
         "api_request_id": api_request_id,
@@ -626,7 +695,7 @@ def _start_root_trace(task_key: str, *, task_id: str, session_id: str, platform:
             with propagate_attributes(
                 session_id=session_id or task_key,
                 trace_name="Hermes turn",
-                tags=["hermes", "langfuse"],
+                tags=_trace_tags(model),
             ):
                 root_ctx = client.start_as_current_observation(
                     trace_context=trace_ctx,
@@ -681,7 +750,8 @@ def _start_child_observation(state: TraceState, *, client: Langfuse, name: str, 
 
 
 def _end_observation(observation: Any, *, output: Any = None, metadata: Optional[dict] = None,
-                     usage_details: Optional[dict] = None, cost_details: Optional[dict] = None) -> None:
+                     usage_details: Optional[dict] = None, cost_details: Optional[dict] = None,
+                     level: Optional[str] = None, status_message: Optional[str] = None) -> None:
     if observation is None:
         return
     try:
@@ -694,11 +764,59 @@ def _end_observation(observation: Any, *, output: Any = None, metadata: Optional
             update_kwargs["usage_details"] = usage_details
         if cost_details:
             update_kwargs["cost_details"] = cost_details
+        if level:
+            update_kwargs["level"] = level
+        if status_message:
+            update_kwargs["status_message"] = status_message
         if update_kwargs:
             observation.update(**update_kwargs)
         observation.end()
     except Exception as exc:  # pragma: no cover - fail-open
         _debug(f"end observation failed: {exc}")
+
+
+def _mark_trace_tool_failure(state: TraceState, *, status: str, status_message: str,
+                             error_metadata: dict[str, Any]) -> None:
+    """Escalate the containing trace when a tool failed or was blocked."""
+    if not _is_tool_failure(status):
+        return
+    with _STATE_LOCK:
+        state.has_tool_failure = True
+    try:
+        state.root_span.update(
+            level="ERROR",
+            status_message=status_message or f"Tool {status}",
+            metadata={
+                "has_tool_failure": True,
+                "last_tool_status": status,
+                **error_metadata,
+            },
+        )
+    except Exception as exc:  # pragma: no cover - fail-open
+        _debug(f"mark trace tool failure failed: {exc}")
+
+
+def _flush_tools_if_due(client: Any, state: TraceState) -> None:
+    """Bound live-trace latency without flushing after every tool by default."""
+    now = time.monotonic()
+    every_tools = _env_positive_int("HERMES_LANGFUSE_FLUSH_EVERY_TOOLS", 5)
+    interval_s = _env_positive_float("HERMES_LANGFUSE_FLUSH_INTERVAL_S", 5.0)
+    with _STATE_LOCK:
+        state.completed_tool_count_since_flush += 1
+        state.last_updated_at = time.time()
+        due = (
+            state.completed_tool_count_since_flush >= every_tools
+            or now - state.last_tool_flush_at >= interval_s
+        )
+        if due:
+            state.completed_tool_count_since_flush = 0
+            state.last_tool_flush_at = now
+    if not due:
+        return
+    try:
+        client.flush()
+    except Exception as exc:  # pragma: no cover - fail-open
+        _debug(f"periodic tool flush failed: {exc}")
 
 
 def _merge_trace_output(output: Any, state: TraceState) -> Any:
@@ -1041,7 +1159,8 @@ def on_post_llm_call(*, task_id: str = "", session_id: str = "", provider: str =
 
 def on_pre_tool_call(*, tool_name: str = "", args: Any = None, task_id: str = "",
                      session_id: str = "", tool_call_id: str = "",
-                     turn_id: str = "", api_request_id: str = "", **_: Any) -> None:
+                     turn_id: str = "", api_request_id: str = "",
+                     middleware_trace: Any = None, **_: Any) -> None:
     client = _get_langfuse()
     if client is None:
         return
@@ -1063,7 +1182,14 @@ def on_pre_tool_call(*, tool_name: str = "", args: Any = None, task_id: str = ""
             name=f"Tool: {tool_name}",
             as_type="tool",
             input_value=_safe_value(args),
-            metadata={"tool_name": tool_name, "tool_call_id": tool_call_id},
+            metadata={
+                "tool_name": tool_name,
+                "tool_call_id": tool_call_id,
+                "langfuse_trace_id": state.trace_id,
+                "hermes_session_id": session_id,
+                "tui_session_id": session_id,
+                "middleware_decisions": _safe_value(middleware_trace or []),
+            },
         )
         if tool_call_id:
             state.tools[tool_call_id] = observation
@@ -1073,7 +1199,10 @@ def on_pre_tool_call(*, tool_name: str = "", args: Any = None, task_id: str = ""
 
 def on_post_tool_call(*, tool_name: str = "", args: Any = None, result: Any = None,
                       task_id: str = "", session_id: str = "", tool_call_id: str = "",
-                      turn_id: str = "", api_request_id: str = "", **_: Any) -> None:
+                      turn_id: str = "", api_request_id: str = "",
+                      duration_ms: int = 0, status: str = "ok",
+                      error_type: Optional[str] = None, error_message: Optional[str] = None,
+                      middleware_trace: Any = None, **_: Any) -> None:
     task_key = _trace_key(
         task_id,
         session_id,
@@ -1083,17 +1212,17 @@ def on_post_tool_call(*, tool_name: str = "", args: Any = None, result: Any = No
     observation = None
 
     with _STATE_LOCK:
-        state = _TRACE_STATE.get(task_key)
-        if state is None:
+        trace_state = _TRACE_STATE.get(task_key)
+        if trace_state is None:
             return
         if tool_call_id:
-            observation = state.tools.pop(tool_call_id, None)
+            observation = trace_state.tools.pop(tool_call_id, None)
         if observation is None:
-            queue = state.pending_tools_by_name.get(tool_name)
+            queue = trace_state.pending_tools_by_name.get(tool_name)
             if queue:
                 observation = queue.pop(0)
                 if not queue:
-                    state.pending_tools_by_name.pop(tool_name, None)
+                    trace_state.pending_tools_by_name.pop(tool_name, None)
 
     if observation is None:
         return
@@ -1104,13 +1233,22 @@ def on_post_tool_call(*, tool_name: str = "", args: Any = None, result: Any = No
         result_value = result
     result_value = _normalize_payload(result_value, tool_name=tool_name, args=args)
     safe_result_value = _safe_value(result_value, parse_json_strings=True)
+    normalized_status = str(status or "ok").strip().lower() or "ok"
+    error_metadata = _tool_error_metadata(
+        args=args,
+        result=result_value,
+        status=normalized_status,
+        error_type=error_type,
+        error_message=error_message,
+    )
+    status_message = str(error_message or error_metadata.get("error_message") or "")
 
     # Backfill so the generation's tool_call record carries the result alongside arguments.
     if tool_call_id:
         with _STATE_LOCK:
-            state = _TRACE_STATE.get(task_key)
-            if state is not None:
-                for tool_call in reversed(state.turn_tool_calls):
+            current_state = _TRACE_STATE.get(task_key)
+            if current_state is not None:
+                for tool_call in reversed(current_state.turn_tool_calls):
                     if tool_call.get("id") == tool_call_id:
                         tool_call["output"] = safe_result_value
                         function_payload = tool_call.get("function")
@@ -1121,8 +1259,32 @@ def on_post_tool_call(*, tool_name: str = "", args: Any = None, result: Any = No
     _end_observation(
         observation,
         output=safe_result_value,
-        metadata={"tool_name": tool_name, "args": _safe_value(args, parse_json_strings=True)},
+        metadata={
+            "tool_name": tool_name,
+            "tool_call_id": tool_call_id,
+            "langfuse_trace_id": trace_state.trace_id,
+            "hermes_session_id": session_id,
+            "tui_session_id": session_id,
+            "duration_ms": max(0, int(duration_ms or 0)),
+            "status": normalized_status,
+            "error_type": error_type or "",
+            "error_message": status_message,
+            "middleware_decisions": _safe_value(middleware_trace or []),
+            "args": _safe_value(args, parse_json_strings=True),
+            **error_metadata,
+        },
+        level="ERROR" if _is_tool_failure(normalized_status) else None,
+        status_message=status_message or None,
     )
+    _mark_trace_tool_failure(
+        trace_state,
+        status=normalized_status,
+        status_message=status_message,
+        error_metadata=error_metadata,
+    )
+    client = _get_langfuse()
+    if client is not None:
+        _flush_tools_if_due(client, trace_state)
 
 
 def register(ctx) -> None:

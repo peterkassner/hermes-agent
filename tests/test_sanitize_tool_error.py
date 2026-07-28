@@ -135,3 +135,43 @@ class TestHandleFunctionCallIntegration:
         assert "<tool_call>" not in payload["error"]
         assert "</tool_call>" not in payload["error"]
         assert "boom" in payload["error"]
+
+    def test_exception_path_emits_failed_observation(self, monkeypatch):
+        import model_tools
+        from tools.registry import registry as tool_registry
+
+        def boom(_args, **_kwargs):
+            raise RuntimeError("boom")
+
+        captured = []
+
+        def invoke_hook(hook_name, **kwargs):
+            if hook_name == "post_tool_call":
+                captured.append(kwargs)
+            return []
+
+        monkeypatch.setattr("hermes_cli.plugins.has_hook", lambda hook_name: hook_name == "post_tool_call")
+        monkeypatch.setattr("hermes_cli.plugins.invoke_hook", invoke_hook)
+        target = tool_registry.get_all_tool_names()[0]
+        original = tool_registry._tools[target].handler
+        tool_registry._tools[target].handler = boom
+        try:
+            model_tools.handle_function_call(
+                target,
+                {},
+                task_id="task-observability",
+                session_id="session-observability",
+                tool_call_id="call-observability",
+                skip_pre_tool_call_hook=True,
+            )
+        finally:
+            tool_registry._tools[target].handler = original
+
+        assert len(captured) == 1
+        observed = captured[0]
+        assert observed["status"] == "error"
+        # Registry normalizes tool-handler exceptions into a structured result;
+        # the observer classifies that result as ``tool_error``.
+        assert observed["error_type"] == "tool_error"
+        assert observed["duration_ms"] >= 0
+        assert observed["tool_call_id"] == "call-observability"
