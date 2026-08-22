@@ -427,6 +427,22 @@ class MemoryManager:
 
         self._providers.append(provider)
 
+        self._index_provider_tools(provider)
+
+        logger.info(
+            "Memory provider '%s' registered (%d tools)",
+            provider.name,
+            len(provider.get_tool_schemas()),
+        )
+
+    def _index_provider_tools(self, provider: MemoryProvider) -> None:
+        """Index the provider's current schemas for executor dispatch.
+
+        Providers may make tools conditional on configuration loaded by
+        ``initialize``.  Re-indexing after initialization keeps the executor's
+        routing table aligned with the schemas subsequently advertised to the
+        model.
+        """
         # Core tool names are reserved — a memory provider must never register
         # a tool that shadows a built-in (e.g. ``clarify``, ``delegate_task``).
         # Built-ins always win, so such a tool is dropped at agent init and
@@ -462,12 +478,6 @@ class MemoryManager:
                     self._tool_to_provider[tool_name].name,
                     provider.name,
                 )
-
-        logger.info(
-            "Memory provider '%s' registered (%d tools)",
-            provider.name,
-            len(provider.get_tool_schemas()),
-        )
 
     @property
     def providers(self) -> List[MemoryProvider]:
@@ -1289,3 +1299,9 @@ class MemoryManager:
                     "Memory provider '%s' initialize failed: %s",
                     provider.name, e,
                 )
+        # A provider's initialized configuration may enable or disable tools.
+        # Rebuild the dispatch table so it exactly matches the tool schemas
+        # that agent initialization will advertise to the model next.
+        self._tool_to_provider.clear()
+        for provider in self._providers:
+            self._index_provider_tools(provider)

@@ -80,6 +80,32 @@ class FakeMemoryProvider(MemoryProvider):
         self.memory_writes.append((action, target, content))
 
 
+class InitializeConditionalToolProvider(FakeMemoryProvider):
+    """Expose a routing tool only after provider configuration is loaded."""
+
+    def __init__(self):
+        super().__init__("conditional")
+
+    def get_tool_schemas(self):
+        if not self.initialized:
+            return [{"name": "always_tool", "description": "always", "parameters": {}}]
+        return [{"name": "configured_tool", "description": "configured", "parameters": {}}]
+
+
+def test_initialize_all_reindexes_conditional_provider_tools():
+    manager = MemoryManager()
+    provider = InitializeConditionalToolProvider()
+    manager.add_provider(provider)
+
+    assert manager.has_tool("always_tool")
+    assert not manager.has_tool("configured_tool")
+
+    manager.initialize_all("session-1")
+
+    assert not manager.has_tool("always_tool")
+    assert manager.has_tool("configured_tool")
+
+
 class MetadataMemoryProvider(FakeMemoryProvider):
     """Provider that opts into write metadata."""
 

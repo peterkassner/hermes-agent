@@ -1933,7 +1933,11 @@ def init_agent(
                         from hermes_cli.profiles import get_active_profile_name
                         _profile = get_active_profile_name()
                         _init_kwargs["agent_identity"] = _profile
-                        _init_kwargs["agent_workspace"] = "hermes"
+                        # Memory providers need the real logical workspace, not
+                        # a product label. runtime_cwd keeps CLI, desktop,
+                        # gateway, and per-session cwd semantics aligned.
+                        from agent.runtime_cwd import resolve_agent_cwd
+                        _init_kwargs["agent_workspace"] = str(resolve_agent_cwd())
                     except Exception:
                         pass
                     # NOTE: status_callback (for the deterministic retain
