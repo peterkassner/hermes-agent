@@ -37,12 +37,14 @@ import json
 import logging
 import os
 import queue
+import stat
 import sys
 import threading
 import time
 
 from dataclasses import dataclass
 from datetime import datetime, timezone
+from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional
 
 from agent.secret_scope import get_secret
@@ -412,6 +414,30 @@ REFLECT_SCHEMA = {
     },
 }
 
+BANK_ROUTING_SCHEMA = {
+    "name": "hindsight_bank",
+    "description": (
+        "Inspect or select the workspace Hindsight bank. At conversation start, "
+        "call action=status before recall or substantive work. If unbound, call "
+        "action=list, ask the user to reuse a listed bank or create a new one, "
+        "then call action=select only after explicit user confirmation."
+    ),
+    "parameters": {
+        "type": "object",
+        "properties": {
+            "action": {"type": "string", "enum": ["status", "list", "select"]},
+            "bank_id": {"type": "string", "description": "Confirmed bank ID for selection."},
+            "create_if_missing": {"type": "boolean", "default": False},
+            "user_confirmed": {
+                "type": "boolean",
+                "description": "True only after explicit user confirmation.",
+                "default": False,
+            },
+        },
+        "required": ["action"],
+    },
+}
+
 
 # ---------------------------------------------------------------------------
 # Config
@@ -585,6 +611,61 @@ def _load_simple_env(path) -> dict[str, str]:
         key, value = line.split("=", 1)
         values[key.strip()] = value.strip()
     return values
+
+
+def _read_workspace_env_value(path: Path, key: str) -> str:
+    """Read one workspace env value without blocking on a mounted FIFO."""
+    if not path.exists():
+        return ""
+    try:
+        if stat.S_ISFIFO(path.stat().st_mode):
+            # 1Password mounts workspace environments as named pipes. The
+            # launcher may already have hydrated the value; never block here.
+            return str(os.environ.get(key, "")).strip().strip("\"'")
+        values = _load_simple_env(path)
+        return str(values.get(key, "")).strip().strip("\"'")
+    except Exception as exc:
+        logger.warning("Could not inspect workspace env %s: %s", path, exc)
+        return ""
+
+
+def _workspace_env_candidates(workspace: str) -> list[Path]:
+    if not workspace:
+        return []
+    root = Path(workspace).expanduser()
+    return [root / ".env"]
+
+
+def _resolve_workspace_bank(workspace: str) -> tuple[str, Path | None]:
+    for path in _workspace_env_candidates(workspace):
+        bank_id = _read_workspace_env_value(path, "HINDSIGHT_BANK_ID")
+        if bank_id:
+            return bank_id, path
+    return "", None
+
+
+def _write_workspace_bank(path: Path, bank_id: str) -> None:
+    """Persist confirmed routing without overwriting mounted secret FIFOs."""
+    if path.exists() and stat.S_ISFIFO(path.stat().st_mode):
+        raise RuntimeError(
+            f"{path} is a mounted named pipe; add HINDSIGHT_BANK_ID={bank_id} "
+            "to its backing environment instead"
+        )
+    existing = path.read_text(encoding="utf-8") if path.exists() else ""
+    lines = existing.splitlines()
+    replacement = f"HINDSIGHT_BANK_ID={bank_id}"
+    replaced = False
+    for index, line in enumerate(lines):
+        if line.strip().startswith("HINDSIGHT_BANK_ID="):
+            lines[index] = replacement
+            replaced = True
+            break
+    if not replaced:
+        if lines and lines[-1].strip():
+            lines.append("")
+        lines.extend(["# Hindsight bank routing", replacement])
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.write_text("\n".join(lines) + "\n", encoding="utf-8")
 
 
 def _build_embedded_profile_env(config: dict[str, Any], *, llm_api_key: str | None = None) -> dict[str, str]:
@@ -883,6 +964,10 @@ class HindsightMemoryProvider(MemoryProvider):
         self._bank_mission = ""
         self._bank_retain_mission: str | None = None
         self._bank_id_template = ""
+        self._workspace_bank_routing = False
+        self._bank_ready = True
+        self._bank_source = "static config"
+        self._workspace_env_path: Path | None = None
 
     @property
     def name(self) -> str:
@@ -1199,6 +1284,7 @@ class HindsightMemoryProvider(MemoryProvider):
             {"key": "llm_model", "description": "LLM model", "default": "gpt-4o-mini", "default_from": {"field": "llm_provider", "map": _PROVIDER_DEFAULT_MODELS}, "when": {"mode": "local_embedded"}},
             {"key": "bank_id", "description": "Memory bank name (static fallback when bank_id_template is unset)", "default": "hermes"},
             {"key": "bank_id_template", "description": "Optional template to derive bank_id dynamically. Placeholders: {profile}, {workspace}, {platform}, {user}, {session}. Example: hermes-{profile}", "default": ""},
+            {"key": "workspace_bank_routing", "description": "Read HINDSIGHT_BANK_ID from the active workspace and require explicit selection when absent", "default": False},
             {"key": "bank_mission", "description": "Mission/purpose description for the memory bank"},
             {"key": "bank_retain_mission", "description": "Custom extraction prompt for memory retention"},
             {"key": "recall_budget", "description": "Recall thoroughness", "default": "mid", "choices": ["low", "mid", "high"]},
@@ -1670,15 +1756,30 @@ class HindsightMemoryProvider(MemoryProvider):
         banks = cfg_get(self._config, "banks", "hermes", default={})
         static_bank_id = self._config.get("bank_id") or banks.get("bankId", "hermes")
         self._bank_id_template = self._config.get("bank_id_template", "") or ""
-        self._bank_id = _resolve_bank_id_template(
-            self._bank_id_template,
-            fallback=static_bank_id,
-            profile=self._agent_identity,
-            workspace=self._agent_workspace,
-            platform=self._platform,
-            user=self._user_id,
-            session=self._session_id,
-        )
+        self._workspace_bank_routing = bool(self._config.get("workspace_bank_routing", False))
+        if self._workspace_bank_routing:
+            workspace_bank, env_path = _resolve_workspace_bank(self._agent_workspace)
+            self._workspace_env_path = env_path
+            if workspace_bank:
+                self._bank_id = workspace_bank
+                self._bank_ready = True
+                self._bank_source = str(env_path)
+            else:
+                self._bank_id = ""
+                self._bank_ready = False
+                self._bank_source = "awaiting explicit user selection"
+        else:
+            self._bank_id = _resolve_bank_id_template(
+                self._bank_id_template,
+                fallback=static_bank_id,
+                profile=self._agent_identity,
+                workspace=self._agent_workspace,
+                platform=self._platform,
+                user=self._user_id,
+                session=self._session_id,
+            )
+            self._bank_ready = True
+            self._bank_source = "template" if self._bank_id_template else "static config"
         budget = self._config.get("recall_budget") or self._config.get("budget") or banks.get("budget", "mid")
         self._budget = budget if budget in _VALID_BUDGETS else "mid"
 
@@ -1839,22 +1940,50 @@ class HindsightMemoryProvider(MemoryProvider):
             t.start()
 
     def system_prompt_block(self) -> str:
+        routing = ""
+        if self._workspace_bank_routing:
+            routing = (
+                "Workspace bank routing is enforced. At the beginning of every conversation, "
+                "call hindsight_bank with action=status before substantive work. If routing is "
+                "unbound, call action=list, show available bank IDs, and ask whether to reuse one "
+                "or create a new bank. Wait for an explicit answer. Then call action=select with "
+                "user_confirmed=true; never guess or silently use a fallback bank. After binding, "
+                "call hindsight_recall using the user's task before substantive work. Retain only "
+                "durable decisions, fixes, gotchas, configuration changes, and end-of-session "
+                "decision chains; never retain secrets or routine chatter. Use hindsight_reflect "
+                "for synthesis across prior memories. Stay on the selected bank for the session.\n"
+            )
         if self._memory_mode == "context":
+            state = (
+                f"Active (context mode), budget: {self._budget}."
+                if routing else
+                f"Active (context mode). Bank: {self._bank_id}, budget: {self._budget}."
+            )
             return (
                 f"# Hindsight Memory\n"
-                f"Active (context mode). Bank: {self._bank_id}, budget: {self._budget}.\n"
+                f"{routing}{state}\n"
                 f"Relevant memories are automatically injected into context."
             )
         if self._memory_mode == "tools":
+            state = (
+                f"Active (tools mode), budget: {self._budget}."
+                if routing else
+                f"Active (tools mode). Bank: {self._bank_id}, budget: {self._budget}."
+            )
             return (
                 f"# Hindsight Memory\n"
-                f"Active (tools mode). Bank: {self._bank_id}, budget: {self._budget}.\n"
+                f"{routing}{state}\n"
                 f"Use hindsight_recall to search, hindsight_reflect for synthesis, "
                 f"hindsight_retain to store facts."
             )
+        state = (
+            f"Active, budget: {self._budget}."
+            if routing else
+            f"Active. Bank: {self._bank_id}, budget: {self._budget}."
+        )
         return (
             f"# Hindsight Memory\n"
-            f"Active. Bank: {self._bank_id}, budget: {self._budget}.\n"
+            f"{routing}{state}\n"
             f"Relevant memories are automatically injected into context. "
             f"Use hindsight_recall to search, hindsight_reflect for synthesis, "
             f"hindsight_retain to store facts."
@@ -1969,6 +2098,9 @@ class HindsightMemoryProvider(MemoryProvider):
         return RecallStatus(provider_label="Hindsight", count=self._last_recall_count, glyph=_HINDSIGHT_GLYPH)
 
     def queue_prefetch(self, query: str, *, session_id: str = "") -> None:
+        if not self._bank_ready:
+            logger.debug("Prefetch: skipped (workspace bank is unbound)")
+            return
         # In synchronous mode prefetch() does a live recall each turn, so
         # there's nothing to prime in the background.
         if self._recall_sync:
@@ -2085,6 +2217,9 @@ class HindsightMemoryProvider(MemoryProvider):
         further sync_turn() calls are dropped — this prevents post-exit
         retains from reaching aiohttp after interpreter shutdown begins.
         """
+        if not self._bank_ready:
+            logger.debug("sync_turn: skipped (workspace bank is unbound)")
+            return
         if not self._auto_retain:
             logger.debug("sync_turn: skipped (auto_retain disabled)")
             return
@@ -2198,10 +2333,20 @@ class HindsightMemoryProvider(MemoryProvider):
 
     def get_tool_schemas(self) -> List[Dict[str, Any]]:
         if self._memory_mode == "context":
-            return []
-        return [RETAIN_SCHEMA, RECALL_SCHEMA, REFLECT_SCHEMA]
+            return [BANK_ROUTING_SCHEMA] if self._workspace_bank_routing else []
+        schemas = [RETAIN_SCHEMA, RECALL_SCHEMA, REFLECT_SCHEMA]
+        if self._workspace_bank_routing:
+            schemas.insert(0, BANK_ROUTING_SCHEMA)
+        return schemas
 
     def handle_tool_call(self, tool_name: str, args: dict, **kwargs) -> str:
+        if tool_name == "hindsight_bank":
+            return self._handle_bank_routing(args)
+        if not self._bank_ready:
+            return tool_error(
+                "Workspace Hindsight bank is unbound. Call hindsight_bank status/list, "
+                "ask the user, then select the explicitly confirmed bank."
+            )
         if tool_name == "hindsight_retain":
             content = args.get("content", "")
             if not content:
@@ -2274,6 +2419,82 @@ class HindsightMemoryProvider(MemoryProvider):
                 return tool_error(f"Failed to reflect: {e}")
 
         return tool_error(f"Unknown tool: {tool_name}")
+
+    def _list_banks(self) -> list[dict[str, str]]:
+        response = self._run_hindsight_operation(
+            lambda client: client.banks.list_banks()
+        )
+        raw = getattr(response, "banks", None)
+        if raw is None and isinstance(response, dict):
+            raw = response.get("banks") or response.get("items") or []
+        result = []
+        for bank in raw or []:
+            if isinstance(bank, dict):
+                bank_id = bank.get("bank_id") or bank.get("bankId") or bank.get("id")
+                name = bank.get("name") or ""
+            else:
+                bank_id = getattr(bank, "bank_id", None) or getattr(bank, "id", None)
+                name = getattr(bank, "name", "") or ""
+            if bank_id:
+                result.append({"bank_id": str(bank_id), "name": str(name)})
+        return result
+
+    def _handle_bank_routing(self, args: dict) -> str:
+        if not self._workspace_bank_routing:
+            return json.dumps({
+                "routing": "disabled",
+                "bank_id": self._bank_id,
+                "source": self._bank_source,
+            })
+        action = str(args.get("action") or "").strip().lower()
+        if action == "status":
+            return json.dumps({
+                "routing": "bound" if self._bank_ready else "unbound",
+                "bank_id": self._bank_id or None,
+                "workspace": self._agent_workspace,
+                "source": self._bank_source,
+            })
+        if action == "list":
+            try:
+                return json.dumps({"banks": self._list_banks()})
+            except Exception as exc:
+                return tool_error(f"Could not list Hindsight banks: {exc}")
+        if action != "select":
+            return tool_error("action must be status, list, or select")
+        if not bool(args.get("user_confirmed", False)):
+            return tool_error("Explicit user confirmation required before selecting a bank")
+        bank_id = _sanitize_bank_segment(str(args.get("bank_id") or ""))
+        if not bank_id:
+            return tool_error("bank_id is required for action=select")
+        try:
+            existing = {item["bank_id"] for item in self._list_banks()}
+            if bank_id not in existing:
+                if not bool(args.get("create_if_missing", False)):
+                    return tool_error(
+                        f"Bank {bank_id!r} does not exist. Ask whether to create it, then retry "
+                        "with create_if_missing=true after confirmation."
+                    )
+                self._run_hindsight_operation(
+                    lambda client: client.acreate_bank(bank_id=bank_id)
+                )
+            candidates = _workspace_env_candidates(self._agent_workspace)
+            env_path = self._workspace_env_path or (candidates[0] if candidates else None)
+            if env_path is None:
+                return tool_error("No active workspace path is available for bank routing")
+            _write_workspace_bank(env_path, bank_id)
+            self._bank_id = bank_id
+            self._bank_ready = True
+            self._workspace_env_path = env_path
+            self._bank_source = str(env_path)
+            return json.dumps({
+                "routing": "bound",
+                "bank_id": bank_id,
+                "workspace": self._agent_workspace,
+                "persisted_to": str(env_path),
+                "next": "Call hindsight_recall with the current task before substantive work.",
+            })
+        except Exception as exc:
+            return tool_error(f"Could not select Hindsight bank: {exc}")
 
     def on_session_switch(
         self,

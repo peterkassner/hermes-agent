@@ -1,6 +1,7 @@
 """Hindsight's declared config surface — rendered by the generic desktop panel."""
 
 from plugins.memory.config_schema import (
+    KIND_BOOL,
     KIND_SECRET,
     KIND_SELECT,
     KIND_TEXT,
@@ -57,6 +58,17 @@ CONFIG_SCHEMA = ProviderConfigSchema(
             kind=KIND_TEXT,
             default="hermes",
             aliases=("bankId",),
+            inline=True,
+        ),
+        ProviderField(
+            key="workspace_bank_routing",
+            label="Workspace bank routing",
+            kind=KIND_BOOL,
+            default=False,
+            description=(
+                "Read HINDSIGHT_BANK_ID from the active workspace and require "
+                "explicit bank selection when it is absent."
+            ),
             inline=True,
         ),
         ProviderField(

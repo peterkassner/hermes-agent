@@ -21,6 +21,7 @@ import pytest
 
 from hermes_cli.memory_setup import _CANCELLED
 from plugins.memory.hindsight import (
+    BANK_ROUTING_SCHEMA,
     HindsightMemoryProvider,
     RECALL_SCHEMA,
     REFLECT_SCHEMA,
@@ -31,7 +32,9 @@ from plugins.memory.hindsight import (
     _normalize_observation_scopes,
     _normalize_retain_tags,
     _resolve_bank_id_template,
+    _resolve_workspace_bank,
     _sanitize_bank_segment,
+    _write_workspace_bank,
 )
 
 
@@ -499,7 +502,6 @@ class TestToolHandlers:
         # The description must steer the model to pass event times.
         assert "event" in props["occurred_at"]["description"].lower()
         assert "occurred_at" not in RETAIN_SCHEMA["parameters"]["required"]
-
 
     def test_recall_success(self, provider):
         result = json.loads(provider.handle_tool_call(
@@ -1317,7 +1319,8 @@ class TestConfigSchema:
         keys = {f["key"] for f in schema}
         expected_keys = {
             "mode", "api_url", "api_key", "llm_provider", "llm_api_key",
-            "llm_model", "bank_id", "bank_id_template", "bank_mission", "bank_retain_mission",
+            "llm_model", "bank_id", "bank_id_template", "workspace_bank_routing",
+            "bank_mission", "bank_retain_mission",
             "recall_budget", "memory_mode", "recall_prefetch_method",
             "retain_tags", "retain_source",
             "retain_user_prefix", "retain_assistant_prefix",
@@ -1328,6 +1331,108 @@ class TestConfigSchema:
             "recall_prompt_preamble",
         }
         assert expected_keys.issubset(keys), f"Missing: {expected_keys - keys}"
+
+
+# ---------------------------------------------------------------------------
+# workspace bank routing tests
+# ---------------------------------------------------------------------------
+
+
+class TestWorkspaceBankRouting:
+    def test_resolves_regular_workspace_env(self, tmp_path):
+        (tmp_path / ".env").write_text("HINDSIGHT_BANK_ID=projects-test\n")
+        assert _resolve_workspace_bank(str(tmp_path)) == (
+            "projects-test", tmp_path / ".env"
+        )
+
+    def test_does_not_search_nested_obsidian_env(self, tmp_path):
+        nested = tmp_path / ".obsidian"
+        nested.mkdir()
+        (nested / ".env").write_text("HINDSIGHT_BANK_ID=wrong-workspace\n")
+        assert _resolve_workspace_bank(str(tmp_path)) == ("", None)
+
+    def test_obsidian_workspace_reads_its_own_env(self, tmp_path):
+        workspace = tmp_path / ".obsidian"
+        workspace.mkdir()
+        (workspace / ".env").write_text("HINDSIGHT_BANK_ID=obsidian-workspace\n")
+        assert _resolve_workspace_bank(str(workspace)) == (
+            "obsidian-workspace", workspace / ".env"
+        )
+
+    def test_resolves_fifo_from_hydrated_environment(self, tmp_path, monkeypatch):
+        env_path = tmp_path / ".env"
+        os.mkfifo(env_path)
+        monkeypatch.setenv("HINDSIGHT_BANK_ID", "mounted-bank")
+        assert _resolve_workspace_bank(str(tmp_path)) == ("mounted-bank", env_path)
+
+    def test_write_persists_without_rewriting_other_env_values(self, tmp_path):
+        env_path = tmp_path / ".env"
+        env_path.write_text("OTHER=value\n")
+        _write_workspace_bank(env_path, "confirmed-bank")
+        assert env_path.read_text() == (
+            "OTHER=value\n\n# Hindsight bank routing\n"
+            "HINDSIGHT_BANK_ID=confirmed-bank\n"
+        )
+
+    def test_missing_env_leaves_provider_unbound(self, tmp_path, monkeypatch):
+        config_path = tmp_path / "hindsight" / "config.json"
+        config_path.parent.mkdir(parents=True)
+        config_path.write_text(json.dumps({
+            "mode": "local_external",
+            "api_url": "http://localhost:8888",
+            "workspace_bank_routing": True,
+        }))
+        monkeypatch.setattr(
+            "plugins.memory.hindsight.get_hermes_home", lambda: tmp_path
+        )
+        provider = HindsightMemoryProvider()
+        provider.initialize(
+            session_id="session-1", platform="cli", agent_workspace=str(tmp_path)
+        )
+
+        assert provider._bank_ready is False
+        assert provider._bank_id == ""
+        assert BANK_ROUTING_SCHEMA in provider.get_tool_schemas()
+        blocked = provider.handle_tool_call("hindsight_recall", {"query": "task"})
+        assert "unbound" in blocked
+
+    def test_list_action_returns_bank_ids(self):
+        provider = HindsightMemoryProvider()
+        provider._workspace_bank_routing = True
+        provider._run_hindsight_operation = lambda operation: SimpleNamespace(
+            banks=[
+                SimpleNamespace(bank_id="agents", name="Agents"),
+                SimpleNamespace(bank_id="hermes", name="Hermes"),
+            ]
+        )
+        listed = json.loads(provider.handle_tool_call(
+            "hindsight_bank", {"action": "list"}
+        ))
+        assert listed == {"banks": [
+            {"bank_id": "agents", "name": "Agents"},
+            {"bank_id": "hermes", "name": "Hermes"},
+        ]}
+
+    def test_confirmed_existing_bank_is_persisted(self, tmp_path, monkeypatch):
+        provider = HindsightMemoryProvider()
+        provider._workspace_bank_routing = True
+        provider._bank_ready = False
+        provider._agent_workspace = str(tmp_path)
+        provider._list_banks = lambda: [{"bank_id": "agents", "name": "Agents"}]
+
+        rejected = provider.handle_tool_call("hindsight_bank", {
+            "action": "select", "bank_id": "agents",
+        })
+        assert "confirmation required" in rejected
+
+        selected = json.loads(provider.handle_tool_call("hindsight_bank", {
+            "action": "select", "bank_id": "agents", "user_confirmed": True,
+        }))
+        assert selected["bank_id"] == "agents"
+        assert provider._bank_ready is True
+        assert (tmp_path / ".env").read_text().endswith(
+            "HINDSIGHT_BANK_ID=agents\n"
+        )
 
 
 # ---------------------------------------------------------------------------
