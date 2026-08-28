@@ -632,8 +632,8 @@ def _read_workspace_env_value(path: Path, key: str) -> str:
 def _workspace_env_candidates(workspace: str) -> list[Path]:
     if not workspace:
         return []
-    root = Path(workspace).expanduser()
-    return [root / ".env"]
+    root = Path(workspace).expanduser().resolve()
+    return [directory / ".env" for directory in (root, *root.parents)]
 
 
 def _resolve_workspace_bank(workspace: str) -> tuple[str, Path | None]:

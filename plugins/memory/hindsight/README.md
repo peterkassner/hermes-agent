@@ -61,7 +61,7 @@ Config file: `~/.hermes/hindsight/config.json`
 |-----|---------|-------------|
 | `bank_id` | `hermes` | Memory bank name (static fallback used when `bank_id_template` is unset or resolves empty) |
 | `bank_id_template` | — | Optional template to derive the bank name dynamically. Placeholders: `{profile}`, `{workspace}`, `{platform}`, `{user}`, `{session}`. Example: `hermes-{profile}` isolates memory per active Hermes profile. Empty placeholders collapse cleanly (e.g. `hermes-{user}` with no user becomes `hermes`). |
-| `workspace_bank_routing` | `false` | Enforce workspace routing. Hermes reads `HINDSIGHT_BANK_ID` from the active workspace `.env`. If the active workspace itself is `.obsidian`, that naturally means `.obsidian/.env`; Hermes does not search a nested `.obsidian` directory. When the key is absent, memory stays unbound until the agent lists banks, asks the user to reuse or create one, and persists the confirmed choice. |
+| `workspace_bank_routing` | `false` | Enforce workspace routing. Hermes reads `HINDSIGHT_BANK_ID` from the active workspace `.env`, then searches each ancestor `.env`; the nearest value wins. If the active workspace itself is `.obsidian`, that naturally starts at `.obsidian/.env`; Hermes does not search a nested `.obsidian` directory. When the key is absent throughout the ancestor chain, memory stays unbound until the agent lists banks, asks the user to reuse or create one, and persists the confirmed choice in the active workspace. |
 | `bank_mission` | — | Reflect mission (identity/framing for reflect reasoning). Applied via Banks API. |
 | `bank_retain_mission` | — | Retain mission (steers what gets extracted). Applied via Banks API. |
 

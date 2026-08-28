@@ -1345,6 +1345,40 @@ class TestWorkspaceBankRouting:
             "projects-test", tmp_path / ".env"
         )
 
+    def test_inherits_bank_from_nearest_ancestor_env(self, tmp_path):
+        workspace = tmp_path / "documents" / "matter" / "drafts"
+        workspace.mkdir(parents=True)
+        documents_env = tmp_path / "documents" / ".env"
+        documents_env.write_text("HINDSIGHT_BANK_ID=fences-drafting\n")
+
+        assert _resolve_workspace_bank(str(workspace)) == (
+            "fences-drafting", documents_env
+        )
+
+    def test_nearest_workspace_env_bank_overrides_ancestor(self, tmp_path):
+        workspace = tmp_path / "documents" / "matter"
+        workspace.mkdir(parents=True)
+        (tmp_path / "documents" / ".env").write_text(
+            "HINDSIGHT_BANK_ID=fences-drafting\n"
+        )
+        workspace_env = workspace / ".env"
+        workspace_env.write_text("HINDSIGHT_BANK_ID=matter-specific\n")
+
+        assert _resolve_workspace_bank(str(workspace)) == (
+            "matter-specific", workspace_env
+        )
+
+    def test_env_without_bank_does_not_block_ancestor_bank(self, tmp_path):
+        workspace = tmp_path / "documents" / "matter"
+        workspace.mkdir(parents=True)
+        documents_env = tmp_path / "documents" / ".env"
+        documents_env.write_text("HINDSIGHT_BANK_ID=fences-drafting\n")
+        (workspace / ".env").write_text("OTHER=value\n")
+
+        assert _resolve_workspace_bank(str(workspace)) == (
+            "fences-drafting", documents_env
+        )
+
     def test_does_not_search_nested_obsidian_env(self, tmp_path):
         nested = tmp_path / ".obsidian"
         nested.mkdir()
