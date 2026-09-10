@@ -315,10 +315,12 @@ export function parseOscColor(data: string): string | undefined {
 // disambiguation. We previously enabled unconditionally (#23350), assuming
 // terminals silently ignore unknown CSI — but some terminals honor the enable
 // and emit codepoints our input parser doesn't handle (notably over SSH and
-// in xterm.js-based terminals like VS Code). tmux is allowlisted because it
-// accepts modifyOtherKeys and doesn't forward the kitty sequence to the outer
-// terminal.
-const EXTENDED_KEYS_TERMINALS = ['iTerm.app', 'kitty', 'WezTerm', 'ghostty', 'tmux', 'windows-terminal', 'vscode']
+// in xterm.js-based terminals like VS Code). iTerm2 also emits
+// modifyOtherKeys Shift+Space as ESC[27;2;32~, which can leak into an Ink
+// render buffer rather than become a keypress; keep it off until that parser
+// path is proven reliable. tmux is allowlisted because it accepts
+// modifyOtherKeys and doesn't forward the kitty sequence to the outer terminal.
+const EXTENDED_KEYS_TERMINALS = ['kitty', 'WezTerm', 'ghostty', 'tmux', 'windows-terminal', 'vscode']
 
 /** True if this terminal correctly handles extended key reporting
  *  (Kitty keyboard protocol + xterm modifyOtherKeys). */

@@ -1,6 +1,11 @@
 import { describe, expect, it } from 'vitest'
 
-import { isSynchronizedOutputSupported, needsAltScreenResizeScrollbackClear, writeDiffToTerminal } from './terminal.js'
+import {
+  isSynchronizedOutputSupported,
+  needsAltScreenResizeScrollbackClear,
+  supportsExtendedKeys,
+  writeDiffToTerminal
+} from './terminal.js'
 import { BSU, ESU } from './termio/dec.js'
 
 describe('terminal resize quirks', () => {
@@ -35,6 +40,32 @@ describe('synchronized output detection', () => {
 
   it('reports no support for an unknown terminal', () => {
     expect(isSynchronizedOutputSupported({ TERM: 'xterm-256color' })).toBe(false)
+  })
+})
+
+describe('extended-key reporting', () => {
+  it('keeps iTerm2 out because modifyOtherKeys Shift+Space leaks into Ink', async () => {
+    const { env } = await import('../utils/env.js')
+    const saved = env.terminal
+
+    try {
+      env.terminal = 'iTerm.app'
+      expect(supportsExtendedKeys()).toBe(false)
+    } finally {
+      env.terminal = saved
+    }
+  })
+
+  it('keeps kitty extended-key reporting enabled', async () => {
+    const { env } = await import('../utils/env.js')
+    const saved = env.terminal
+
+    try {
+      env.terminal = 'kitty'
+      expect(supportsExtendedKeys()).toBe(true)
+    } finally {
+      env.terminal = saved
+    }
   })
 })
 
