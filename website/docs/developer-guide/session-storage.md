@@ -13,6 +13,20 @@ workers write through that owner (`RuntimeSessionStore` RPC), never by opening
 
 Source files: `hermes_state.py` (facade) plus the `hermes_state_*.py` siblings (schema, fts, search, compression, portability, gateway, ...)
 
+## Turn lease renewal after suspend
+
+An active turn renews its five-minute database lease periodically. System sleep
+can prevent callbacks from running long enough for the local deadline to pass.
+On resume, the refresher makes one holder-qualified renewal attempt without
+lock retries. It continues only if the database still assigns the row to that
+same turn; a successor's lease is never acquired or overwritten. This also
+handles transcript writes that have already renewed the row after wake.
+
+A missing or replaced holder, or a database lock preventing this check, stops
+the turn to protect the transcript. Logs distinguish a missed local deadline,
+successful recovery, and exhausted SQLite lock retries. Increasing the context
+window or changing the memory provider does not repair a missed lease renewal.
+
 ## Hermes home and profile isolation
 
 `get_hermes_home()` is the authoritative filesystem resolver for state and

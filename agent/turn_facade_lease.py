@@ -204,10 +204,10 @@ class DurableTurnLease:
         tick only while the next attempt still lands before ``_authority_deadline``. Returning
         False stops the timer.
 
-        Acquisition reclaims a row once ``expires_at <= now``, even if the old process is
-        alive. Holder-qualified release does not block that path, so a run of lock errors
-        must not keep this turn active up to and past the deadline. A successful renewal
-        is the only thing that moves the deadline.
+        Acquisition can reclaim an expired row. After suspend, however, an expired LOCAL
+        deadline is not proof of takeover: transcript writes may already have renewed the
+        row. One no-retry, holder-qualified renewal checks ownership atomically, just like
+        the transcript write guard. Lock errors never extend the local deadline.
 
         The holder-qualified UPDATE fences a late refresher from a successor lease. The façade's
         finally sets ``stop`` before releasing, so a holder-fenced miss observed after stop is not
@@ -219,14 +219,22 @@ class DurableTurnLease:
         # write lock past expiry keeps this turn running while a successor reclaims the row. The
         # margin covers one BEGIN IMMEDIATE that blocks in SQLite's busy handler past the patience.
         patience = self._authority_deadline - _REFRESH_EXPIRY_MARGIN_S - started
-        if patience <= 0:
-            return self._stop_on_exhausted_authority()
+        delayed = patience <= 0
+        if delayed:
+            logger.warning(
+                "Session turn lease renewal missed its local deadline by %.1fs; checking durable holder: %s",
+                started - self._authority_deadline, self._current_session_id(),
+            )
         try:
             if self.db.refresh_session_turn_lease(
                 self._current_session_id(), self.holder, ttl_seconds=LEASE_TTL_SECONDS,
-                patience_s=min(_REFRESH_WRITE_PATIENCE_S, patience),
+                # Expiry makes our row reclaimable, not necessarily reclaimed. Never wait
+                # or acquire a new row here: only the still-matching holder can renew it.
+                patience_s=0.0 if delayed else min(_REFRESH_WRITE_PATIENCE_S, patience),
             ):
                 self._authority_deadline = started + LEASE_TTL_SECONDS
+                if delayed:
+                    logger.info("Session turn lease recovered after delayed renewal: %s", self._current_session_id())
                 return None
             if self.stop.is_set():
                 return False
