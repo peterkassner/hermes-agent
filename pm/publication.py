@@ -83,12 +83,13 @@ class PluginSelection:
     def __init__(self, selection: dict):
         from hermes_yaml import roundtrip_yaml
         from pm.plugin_eviction import settle_record
+        from pm.plugins_state import config_path_is_in_dependency_scope
 
         self.configs = selection_snapshot()
         self.home = Path(selection["home"]).resolve()
-        if not self.home.is_relative_to(dependency_home_root().resolve()):
-            raise ValueError("config path is outside Hermes state")
         self.path = self.home / "config.yaml"
+        if not config_path_is_in_dependency_scope(self.path):
+            raise ValueError("config path is outside Hermes state")
         self.previous = read_bytes_or_none(self.path)  # config-reader: ok — pm publication: byte-level compare-and-swap rewrite of the local file
         expected = selection.get("expected_config")
         actual = hashlib.sha256(self.previous).hexdigest() if self.previous is not None else "missing"

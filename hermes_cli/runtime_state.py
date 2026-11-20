@@ -91,6 +91,8 @@ def _recover_plugin_publication(project: Path, row: dict, journal: Path) -> None
 
 def recover_publication(project: Path) -> None:
     """Recover while holding runtime_lock, before activation or another write."""
+    from pm.plugins_state import config_path_is_in_dependency_scope
+
     journal = install_state_dir(project) / "publication.json"
     data = _bytes(journal)
     if data is None:
@@ -105,7 +107,7 @@ def recover_publication(project: Path) -> None:
         configs = []
         for entry in entries:
             config = Path(entry["config"])
-            if config.name != "config.yaml" or not config.resolve().is_relative_to(dependency_home_root().resolve()):
+            if not config_path_is_in_dependency_scope(config):
                 raise ValueError("config path is outside Hermes state")
             previous = base64.b64decode(entry["previous"], validate=True) if entry["previous"] is not None else None
             configs.append((config, previous, entry.get("config_after")))

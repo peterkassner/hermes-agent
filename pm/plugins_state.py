@@ -146,6 +146,24 @@ def dependency_homes() -> list[Path]:
     return homes
 
 
+def config_path_is_in_dependency_scope(config: Path) -> bool:
+    """Authorize in-root configs or the exact config of a registered live profile.
+
+    A named profile may be a directory symlink outside the state root. That
+    registration authorizes its config only, never arbitrary descendants or an
+    independently escaping config-file symlink. Recovery uses the same live
+    registration check as publication, so a removed/retargeted home is refused.
+    """
+    from pm.environments import dependency_home_root
+
+    if config.name != "config.yaml":
+        return False
+    resolved = config.resolve()
+    if resolved.is_relative_to(dependency_home_root().resolve()):
+        return True
+    return any(resolved == home.resolve() / "config.yaml" for home in dependency_homes())
+
+
 def enabled_plugins_ordered(*, proposed_home=None, enabled=None, disabled=None,
                             installing: Path | None = None,
                             skip_invalid_secondary: bool = False) -> dict[Path, list[str]]:
